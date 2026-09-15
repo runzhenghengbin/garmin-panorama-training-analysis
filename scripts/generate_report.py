@@ -123,6 +123,84 @@ def aggregate_zones(runs):
     return seconds, bl
 
 
+def build_zone_stack(runs):
+    """每次跑步的心率五区时长占比（100% 堆叠柱用），按日期升序。"""
+    ordered = sorted(runs, key=lambda r: r["date"])
+    labels, cols = [], [[] for _ in range(5)]
+    for r in ordered:
+        zs = {z.get("zone"): (z.get("seconds") or 0) for z in (r.get("hr_zones") or []) if z.get("zone")}
+        tot = sum(zs.values())
+        if tot < 60:  # 太短的活动（热身/测试）不进堆叠图
+            continue
+        labels.append(f"{md_label(r['date'])} {r['distance_km']:.1f}k")
+        for i in range(5):
+            cols[i].append(round((zs.get(i + 1) or 0) / tot * 100, 1))
+    return labels, cols
+
+
+def linreg(pts):
+    """最小二乘拟合 y = a + b*x，返回 (a, b, r2)；样本不足返回 (None, None, None)。"""
+    n = len(pts)
+    if n < 3:
+        return None, None, None
+    mx = sum(p["x"] for p in pts) / n
+    my = sum(p["y"] for p in pts) / n
+    sxx = sum((p["x"] - mx) ** 2 for p in pts)
+    if not sxx:
+        return None, None, None
+    b = sum((p["x"] - mx) * (p["y"] - my) for p in pts) / sxx
+    a = my - b * mx
+    ss_tot = sum((p["y"] - my) ** 2 for p in pts) or 1
+    ss_res = sum((p["y"] - (a + b * p["x"])) ** 2 for p in pts)
+    return a, b, round(1 - ss_res / ss_tot, 3)
+
+
+def build_efficiency(runs, lt_hr, target_pace):
+    """
+    有氧效率分析：逐公里 配速-心率 散点 + 线性拟合 + 长距离有氧漂移。
+    返回 (groups, all_pts, (a, b, r2), pred_hr, drift)
+      groups: [{label, color, points:[{x:pace_s, y:hr}]}]
+      pred_hr: 按拟合式外推目标配速下的心率
+      drift:   最长一次跑的前后各 1/3 公里效率比衰减（%）
+    """
+    palette = ["#72e8ff", "#d6ff64", "#ffc857", "#ff6b5f", "#a78bfa", "#5eead4", "#f472b6", "#8b938a"]
+    ordered = sorted(runs, key=lambda r: r["date"])
+    groups, all_pts = [], []
+    for i, r in enumerate(ordered):
+        pts = []
+        for s in r.get("splits_km") or []:
+            p, h = s.get("pace_s"), s.get("avg_hr")
+            if p and h and 150 <= p <= 1500 and 90 <= h <= 220:
+                pts.append({"x": round(float(p)), "y": round(float(h))})
+        if len(pts) < 3:
+            continue
+        groups.append({
+            "label": f"{md_label(r['date'])} {r['distance_km']:.1f}k",
+            "color": palette[i % len(palette)],
+            "points": pts,
+        })
+        all_pts.extend(pts)
+
+    a, b, r2 = linreg(all_pts)
+    pred_hr = round(a + b * target_pace) if (a is not None and target_pace) else None
+
+    # 有氧漂移：最长一次，比较前 1/3 与后 1/3 公里的效率比 EF = 速度(m/s) / 心率
+    drift = None
+    longest = max(ordered, key=lambda r: r["distance_km"]) if ordered else None
+    if longest:
+        sp = [s for s in (longest.get("splits_km") or []) if s.get("pace_s") and s.get("avg_hr")]
+        if len(sp) >= 6:
+            k = max(len(sp) // 3, 1)
+            ef = lambda xs: sum((1000 / s["pace_s"]) / s["avg_hr"] for s in xs) / len(xs)
+            e1, e2 = ef(sp[:k]), ef(sp[-k:])
+            if e1:
+                drift = {
+                    "run": f"{md_label(longest['date'])} · {longest['distance_km']:.1f} km",
+                    "pct": round((e1 - e2) / e1 * 100, 2),
+                }
+    return groups, all_pts, (a, b, r2), pred_hr, drift
+
+
 def evaluate_heat(runs, lt_hr):
     """逐次跑步的热应激评价（含 WBGT / 体感 / 跨日适应信号）。"""
     if lt_hr:
@@ -401,6 +479,38 @@ def render_html(data, ctx):
                 f"<td><b>{pct:.1f}%</b></td></tr>"
             )
 
+    # ---------- 有氧效率结论卡 ----------
+    eff = ctx.get("efficiency") or {}
+    eff_html = ""
+    if eff.get("n_pts"):
+        li = []
+        if eff.get("r2") is not None and eff.get("slope") is not None:
+            li.append(
+                f"共 {eff['n_pts']} 个逐公里样本（{eff['n_groups']} 次跑步），拟合式 "
+                f"<b>心率 ≈ {eff['intercept']:.0f} {eff['slope']:+.3f} × 配速(秒/km)</b>，"
+                f"R² = <b>{eff['r2']}</b>"
+                + ("，相关性良好，配速与心率基本同步。" if eff["r2"] >= 0.6
+                   else "，离散偏大，坡度 / 气温 / 疲劳对心率影响明显。"))
+        if eff.get("pred_hr") and eff.get("target_pace") and eff.get("lt_hr"):
+            pct = round(eff["pred_hr"] / eff["lt_hr"] * 100)
+            verdict = "处于可持续区间，比赛日留有余量。" if pct <= 90 else "偏高，需再压一档配速或继续补有氧。"
+            li.append(
+                f"把目标配速 <b>{fmt_pace(eff['target_pace'])}/km</b> 代入拟合式 → 预测心率 "
+                f"<b>{eff['pred_hr']} bpm</b>，为乳酸阈 {eff['lt_hr']} bpm 的 <b>{pct}%</b>，{verdict}")
+        d = eff.get("drift")
+        if d and d.get("pct") is not None:
+            okd = abs(d["pct"]) < 5
+            li.append(
+                f"最长一次 {d['run']} 的有氧漂移 <b>{d['pct']:+.1f}%</b>"
+                + ("，低于 5%，同心率下后程掉速可控，有氧基础扎实。"
+                   if okd else "，达到或超过 5%，后程同等心率下掉速偏多，长距离耐力与补给仍需加强。"))
+        if li:
+            eff_html = (
+                '<div class="deep-analysis-list"><div class="deep-analysis-card">'
+                '<span>AEROBIC EFFICIENCY</span><h3>配速-心率关系解读</h3>'
+                '<ul style="margin:8px 0 0;padding-left:18px;color:var(--muted);font-size:11px;line-height:1.7">'
+                + "".join(f"<li>{x}</li>" for x in li) + "</ul></div></div>")
+
     heat_cards = ""
     if ctx["heat_rows"]:
         h = ctx["heat_rows"][-1]
@@ -592,8 +702,8 @@ def render_html(data, ctx):
 
 <section class="section">
   <div class="section-heading">
-    <div><span class="section-number">03</span><span class="section-icon">◈</span><h2>心率强度分布</h2></div>
-    <div class="section-meta">Garmin 5 分区 · 按时间占比</div>
+    <div><span class="section-number">03</span><span class="section-icon">◈</span><h2>心率强度与有氧效率</h2></div>
+    <div class="section-meta">Garmin 5 分区 · 逐课构成 · 配速-心率拟合</div>
   </div>
   <div class="chart-card">
     <h3>各心率区间停留时间</h3>
@@ -601,6 +711,17 @@ def render_html(data, ctx):
     <div class="chart-wrap"><canvas id="c6"></canvas></div>
   </div>
   {'<div class="table-card"><table class="data-table"><thead><tr><th>区间</th><th>心率</th><th>时长</th><th>占比</th></tr></thead><tbody>' + zone_rows + '</tbody></table></div>' if zone_rows else ''}
+  <div class="chart-card">
+    <h3>每堂课心率区间构成</h3>
+    <p class="hint">100% 堆叠 · Z1 灰 → Z5 红；轻松跑整根应压在蓝绿段，橙红占大头 = 强度失控</p>
+    <div class="chart-wrap"><canvas id="c11"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>配速-心率效率散点</h3>
+    <p class="hint">每点 = 1 公里（全部跑步）；横轴向右 = 更快，红色虚线 = 线性拟合，点越贴线效率越稳定</p>
+    <div class="chart-wrap" style="height:320px"><canvas id="c12"></canvas></div>
+  </div>
+  {eff_html}
 </section>
 
 <section class="section">
@@ -760,6 +881,51 @@ new Chart(document.getElementById('c6'), {{
   options: mixY({{}}).options || {{}}
 }});
 
+const ZS = {{
+  labels: {js['zs_labels']},
+  z: [{js['zs_z1']}, {js['zs_z2']}, {js['zs_z3']}, {js['zs_z4']}, {js['zs_z5']}],
+  colors: ['#4b5a52', C.cool, C.accent, C.warn, C.danger]
+}};
+if (ZS.labels.length) {{
+  new Chart(document.getElementById('c11'), {{
+    type: 'bar',
+    data: {{ labels: ZS.labels, datasets: ZS.colors.map(function (c, i) {{
+      return {{ label: 'Z' + (i + 1), data: ZS.z[i], backgroundColor: c, borderRadius: 2, borderWidth: 0 }};
+    }}) }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      scales: {{
+        x: {{ stacked: true, grid: {{ display: false }}, ticks: {{ autoSkip: false, maxRotation: 45, font: {{ size: 9 }} }} }},
+        y: {{ stacked: true, min: 0, max: 100, ticks: {{ callback: function (v) {{ return v + '%'; }} }} }}
+      }},
+      plugins: {{
+        legend: {{ position: 'bottom', labels: {{ boxWidth: 10, font: {{ size: 10 }}, padding: 8 }} }},
+        tooltip: {{ callbacks: {{ label: function (c) {{ return c.dataset.label + '：' + c.parsed.y + '%'; }} }} }}
+      }}
+    }}
+  }});
+}}
+
+const pstr = function (s) {{ return Math.floor(s / 60) + ':' + String(Math.round(s) % 60).padStart(2, '0'); }};
+const EFF = {js['eff_datasets']};
+if (EFF.length) {{
+  new Chart(document.getElementById('c12'), {{
+    type: 'scatter',
+    data: {{ datasets: EFF }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      scales: {{
+        x: {{ type: 'linear', reverse: true, title: {{ display: true, text: '配速 秒/km（向右更快）', font: {{ size: 10 }} }}, ticks: {{ callback: pstr }} }},
+        y: {{ title: {{ display: true, text: '平均心率 bpm', font: {{ size: 10 }} }} }}
+      }},
+      plugins: {{
+        legend: {{ position: 'bottom', labels: {{ boxWidth: 10, font: {{ size: 9 }}, padding: 6, usePointStyle: true }} }},
+        tooltip: {{ callbacks: {{ label: function (c) {{ return c.dataset.label + '：' + pstr(c.parsed.x) + '/km · ' + c.parsed.y + ' bpm'; }} }} }}
+      }}
+    }}
+  }});
+}}
+
 new Chart(document.getElementById('c7'), mixY({{
   data: {{
     labels: {js['heat_labels']},
@@ -864,6 +1030,29 @@ def self_check(html, ctx, out_path):
             ok = False
             msgs.append(f"[数据] {dk} 全为 0 —— 图表会是空的")
 
+    # 心率区间堆叠柱（5 列等长、总和必须 > 0）
+    if js.get("zs_labels"):
+        for i in range(1, 6):
+            col = js.get(f"zs_z{i}") or []
+            if len(col) != len(js["zs_labels"]):
+                ok = False
+                msgs.append(f"[数据] zs_z{i}({len(col)}) 与 zs_labels({len(js['zs_labels'])}) 长度不一致")
+        if sum(sum(js.get(f"zs_z{i}") or []) for i in range(1, 6)) <= 0:
+            ok = False
+            msgs.append("[数据] 心率区间堆叠柱总和为 0")
+
+    # 配速-心率散点（点数与分组数一致、样本量足够拟合）
+    if js.get("eff_labels"):
+        if len(js.get("eff_n") or []) != len(js["eff_labels"]):
+            ok = False
+            msgs.append("[数据] eff_n 与 eff_labels 长度不一致")
+        if sum(js.get("eff_n") or []) < 3:
+            ok = False
+            msgs.append("[数据] 配速-心率散点样本不足 3 个")
+    if js.get("eff_labels") and not (js.get("eff_datasets") or []):
+        ok = False
+        msgs.append("[数据] 有散点分组但 eff_datasets 为空")
+
     # 日期标签格式必须符合 MM/DD
     for lab in (js.get("day_labels") or [])[:3]:
         if not re.match(r"^\d{2}/\d{2}$", lab or ""):
@@ -939,6 +1128,30 @@ def main():
     total_zone_s = sum(zone_seconds) or 1
     zone_dist = [round(s / total_zone_s * 100, 1) for s in zone_seconds]
 
+    # ---- 每堂课区间构成（100% 堆叠） ----
+    zs_labels, zs_cols = build_zone_stack(runs)
+
+    # ---- 有氧效率（配速-心率散点 + 拟合 + 漂移） ----
+    goals_cfg = data["config"].get("goals") or {}
+    eff_groups, eff_pts, (eff_a, eff_b, eff_r2), eff_pred_hr, eff_drift = build_efficiency(
+        runs, data["athlete"].get("lt_hr") or 172, goals_cfg.get("target_pace_sec_per_km"))
+    eff_fit = []
+    if eff_a is not None and eff_pts:
+        xs = [p["x"] for p in eff_pts]
+        x1, x2 = min(xs), max(xs)
+        eff_fit = [{"x": x1, "y": round(eff_a + eff_b * x1, 1)},
+                   {"x": x2, "y": round(eff_a + eff_b * x2, 1)}]
+    eff_datasets = [{
+        "type": "scatter", "label": g["label"], "data": g["points"],
+        "backgroundColor": g["color"], "pointRadius": 3.5, "pointHoverRadius": 6,
+    } for g in eff_groups]
+    if eff_fit:
+        eff_datasets.append({
+            "type": "line", "label": "线性拟合", "data": eff_fit,
+            "borderColor": "#ff6b5f", "borderDash": [6, 4], "borderWidth": 2,
+            "pointRadius": 0, "fill": False,
+        })
+
     # ---- 热适应 ----
     lt_hr = data["athlete"].get("lt_hr") or 172
     heat_rows, (heat_enriched, heat_signals) = evaluate_heat(runs, lt_hr)
@@ -998,6 +1211,15 @@ def main():
         "prediction": prediction,
         "tech_stability": tech,
         "weeks": weeks,
+        "efficiency": {
+            "n_pts": len(eff_pts),
+            "n_groups": len(eff_groups),
+            "slope": eff_b, "intercept": eff_a, "r2": eff_r2,
+            "pred_hr": eff_pred_hr,
+            "target_pace": goals_cfg.get("target_pace_sec_per_km"),
+            "drift": eff_drift,
+            "lt_hr": lt_hr,
+        },
         "js": {
             "colors": CHART_COLORS,
             "day_labels": [d["label"] for d in days],
@@ -1016,6 +1238,12 @@ def main():
             "km_vo": [s["vertical_osc_cm"] for s in fs[:30]],
             "zone_labels": [f"Z{i+1}" for i in range(len(zone_seconds))],
             "zone_minutes": [round(s / 60, 1) for s in zone_seconds],
+            "zs_labels": zs_labels,
+            "zs_z1": zs_cols[0], "zs_z2": zs_cols[1], "zs_z3": zs_cols[2],
+            "zs_z4": zs_cols[3], "zs_z5": zs_cols[4],
+            "eff_datasets": eff_datasets,
+            "eff_labels": [g["label"] for g in eff_groups],
+            "eff_n": [len(g["points"]) for g in eff_groups],
             "heat_labels": [r["label"] for r in heat_rows],
             "heat_wbgt": [round(r["wbgt"], 1) for r in heat_rows],
             "heat_hr": [r["avg_hr"] for r in heat_rows],
