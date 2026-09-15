@@ -1,0 +1,41 @@
+{
+  "_comment": "示例配置。复制为 config.json 后填写你自己的资料（config.json 已被 .gitignore 忽略，不会被提交）。",
+  "athlete": {
+    "name": "跑者",
+    "sex": "male",
+    "age": 30,
+    "height_cm": 175,
+    "weight_kg": null,
+    "bodyfat_pct": null,
+    "max_hr": null,
+    "lt_hr": null,
+    "resting_hr": null
+  },
+  "location": {
+    "_comment": "天气回退坐标（活动无 GPS 时使用）。默认北京。",
+    "name": "北京",
+    "latitude": 39.9042,
+    "longitude": 116.4074
+  },
+  "goals": {
+    "race_name": "目标赛事",
+    "race_date": "2026-12-31",
+    "race_distance_km": 42.195,
+    "target_finish": "4:30:00",
+    "target_pace_sec_per_km": 384,
+    "stretch_finish": "4:15:00",
+    "weekly_volume_target_km": 50
+  },
+  "hr_zone_source": "garmin",
+  "manual_hr_zones": null,
+  "activity_factor": 1.55,
+  "macro": {
+    "protein_g_per_kg": 2.0,
+    "carb_g_per_kg": 5.0,
+    "fat_g_per_kg": 1.0
+  },
+  "report": {
+    "style": "ride-relief",
+    "inline_chartjs": true
+  }
+}
